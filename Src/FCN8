@@ -1,0 +1,177 @@
+import os
+import cv2
+import numpy as np
+from glob import glob
+from tensorflow.keras.utils import to_categorical
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.layers import Conv2D, Conv2DTranspose, Add, Input
+from tensorflow.keras.models import Model
+from tensorflow.keras.callbacks import EarlyStopping
+
+# Define paths
+image_dir = "D:/02_Software Development/2_CloverGrass/Raw_data/test/Images"
+label_dir = "D:/02_Software Development/2_CloverGrass/Raw_data/test/ImageLabels"
+
+def preprocess_image(image_path, label_path, target_size=(224, 224)):
+    img = cv2.imread(image_path)
+    img = cv2.resize(img, target_size)
+    img = img / 255.0  # Normalize to [0,1]
+
+    label = cv2.imread(label_path, cv2.IMREAD_GRAYSCALE)
+    label = cv2.resize(label, target_size, interpolation=cv2.INTER_NEAREST)
+    label[label > 1] = 1  # Ensure binary encoding
+    label = to_categorical(label, num_classes=2)  # One-hot encode
+
+    return img, label
+
+def load_data(image_dir, label_dir, target_size=(224, 224)):
+    images = []
+    labels = []
+
+    image_paths = glob(os.path.join(image_dir, "*.jpg"))  # Load .jpg images
+    
+    for img_path in image_paths:
+        label_name = os.path.splitext(os.path.basename(img_path))[0] + ".png"
+        label_path = os.path.join(label_dir, label_name)
+        
+        # Check if label exists
+        if not os.path.exists(label_path):
+            print(f"Label not found for {img_path} - Expected: {label_path}")
+            continue  # Skip images without matching labels
+        
+        img, lbl = preprocess_image(img_path, label_path, target_size)
+        images.append(img)
+        labels.append(lbl)
+
+    return np.array(images), np.array(labels)
+
+# Load the data
+images, labels = load_data(image_dir, label_dir, target_size=(224, 224))
+
+# Preview an example
+plt.figure(figsize=(10, 5))
+plt.subplot(1, 2, 1)
+plt.imshow(images[0])
+plt.title("Preprocessed Image")
+plt.subplot(1, 2, 2)
+plt.imshow(np.argmax(labels[0], axis=-1), cmap="gray")
+plt.title("Preprocessed Label")
+plt.show()
+
+def FCN8s(input_shape=(224, 224, 3), num_classes=2):
+    # Load pre-trained VGG16 as the encoder, excluding the dense layers
+    vgg = VGG16(weights='imagenet', include_top=False, input_shape=input_shape)
+    
+    # Extract specific layers for skip connections
+    f3 = vgg.get_layer("block3_pool").output  # Layer at 1/8 resolution
+    f4 = vgg.get_layer("block4_pool").output  # Layer at 1/16 resolution
+    f5 = vgg.get_layer("block5_pool").output  # Layer at 1/32 resolution
+
+    # Decoder: Upsample and add skip connections
+    o = Conv2DTranspose(512, (4, 4), strides=(2, 2), padding="same")(f5)
+    o = Add()([o, f4])
+    
+    o = Conv2DTranspose(256, (4, 4), strides=(2, 2), padding="same")(o)
+    o = Add()([o, f3])
+
+    o = Conv2DTranspose(128, (16, 16), strides=(8, 8), padding="same")(o)
+    output = Conv2D(num_classes, (1, 1), activation="softmax")(o)
+    
+    # Define model
+    model = Model(inputs=vgg.input, outputs=output)
+    return model
+
+# Initialize model
+model = FCN8s(input_shape=(224, 224, 3), num_classes=2)
+model.summary()
+
+model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"])
+
+# Define callbacks
+early_stopping = EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
+
+# Train the model
+history = model.fit(
+    images, labels,
+    validation_split=0.2,
+    epochs=50,
+    batch_size=8,
+    callbacks=[early_stopping]
+)
+
+# Evaluate the model
+loss, accuracy = model.evaluate(images, labels)
+print(f"Loss: {loss}, Accuracy: {accuracy}")
+
+# Make predictions
+preds = model.predict(images)
+
+# Number of samples to display
+num_samples = 1
+
+# Plot comparison of predictions vs actual labels
+plt.figure(figsize=(15, num_samples * 5))
+
+for i in range(num_samples):
+    # Original image
+    plt.subplot(num_samples, 3, i * 3 + 1)
+    plt.imshow(images[i])
+    plt.title("Original Image")
+    plt.axis('off')
+    
+    # Ground truth label
+    plt.subplot(num_samples, 3, i * 3 + 2)
+    plt.imshow(np.argmax(labels[i], axis=-1), cmap="Greens")
+    plt.title("Ground Truth Label")
+    plt.axis('off')
+    
+    # Predicted label
+    plt.subplot(num_samples, 3, i * 3 + 3)
+    plt.imshow(np.argmax(preds[i], axis=-1), cmap="Greens")
+    plt.title("Predicted Label")
+    plt.axis('off')
+
+plt.tight_layout()
+plt.show()
+
+import matplotlib.pyplot as plt
+
+def calculate_clover_coverage(pred):
+    clover_pixels = np.sum(np.argmax(pred, axis=-1) == 1)  # Clover class is labeled as 1
+    total_pixels = pred.shape[0] * pred.shape[1]
+    coverage_percentage = (clover_pixels / total_pixels) * 100
+    return coverage_percentage
+
+# Calculate clover coverage percentages for predictions and ground truth
+actual_coverages = [calculate_clover_coverage(label) for label in labels]
+predicted_coverages = [calculate_clover_coverage(pred) for pred in preds]
+
+# Create a scatter plot
+plt.figure(figsize=(10, 6))
+plt.scatter(range(len(actual_coverages)), actual_coverages, label="Actual Clover Coverage", color="blue")
+plt.scatter(range(len(predicted_coverages)), predicted_coverages, label="Predicted Clover Coverage", color="red")
+
+# Plot details
+plt.xlabel("Image Index")
+plt.ylabel("Clover Coverage (%)")
+plt.title("Predicted vs Actual Clover Coverage")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+unique, counts = np.unique(np.argmax(labels, axis=-1), return_counts=True)
+print("Actual Class Distribution:", dict(zip(unique, counts)))
+
+unique_pred, counts_pred = np.unique(np.argmax(preds, axis=-1), return_counts=True)
+print("Predicted Class Distribution:", dict(zip(unique_pred, counts_pred)))
+
+from sklearn.utils.class_weight import compute_class_weight
+
+# Assuming 0 for non-clover and 1 for clover
+class_weights = compute_class_weight('balanced', classes=[0, 1], y=np.argmax(labels, axis=-1).flatten())
+class_weights = dict(enumerate(class_weights))
+
+model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"], loss_weights=class_weights)
